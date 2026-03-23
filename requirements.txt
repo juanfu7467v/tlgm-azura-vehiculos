@@ -1,0 +1,7 @@
+flask
+flask-cors
+telethon>=1.31.1
+aiohttp
+gunicorn
+requests
+google-cloud-storage==2.13.0
