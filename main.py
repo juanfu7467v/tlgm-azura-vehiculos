@@ -470,6 +470,60 @@ def validate_doc(doc: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
+# LIMPIEZA DE ALMACENAMIENTO
+# Se ejecuta en cada petición para evitar que el
+# disco (512 MB del VM) se llene con archivos temporales.
+# ─────────────────────────────────────────────
+MAX_STORAGE_MB    = 400   # Umbral de cuota (margen sobre los 512 MB del VM)
+MAX_FILE_AGE_SECS = 3600  # Archivos con > 1 hora de antigüedad se eliminan siempre
+
+
+def clean_storage():
+    """
+    Limpia el directorio de descargas en dos pasadas:
+      1. Elimina archivos con más de MAX_FILE_AGE_SECS de antigüedad.
+      2. Si el uso total sigue superando MAX_STORAGE_MB, borra los más
+         antiguos primero hasta quedar por debajo del umbral.
+    """
+    try:
+        now = time.time()
+        files_info = []
+        for fname in os.listdir(DOWNLOAD_DIR):
+            fpath = os.path.join(DOWNLOAD_DIR, fname)
+            if os.path.isfile(fpath):
+                files_info.append((fpath, os.path.getmtime(fpath), os.path.getsize(fpath)))
+
+        # Pasada 1 — eliminar por antigüedad
+        removed = 0
+        for fpath, mtime, _ in files_info:
+            if now - mtime > MAX_FILE_AGE_SECS:
+                try:
+                    os.remove(fpath)
+                    removed += 1
+                except Exception:
+                    pass
+        if removed:
+            print(f"🧹 clean_storage: {removed} archivo(s) eliminados por antigüedad")
+
+        # Pasada 2 — eliminar por cuota si sigue alto
+        remaining = [(p, m, s) for p, m, s in files_info if os.path.isfile(p)]
+        total_mb = sum(s for _, _, s in remaining) / (1024 * 1024)
+        if total_mb > MAX_STORAGE_MB:
+            remaining.sort(key=lambda x: x[1])  # más antiguos primero
+            for fpath, _, size in remaining:
+                if total_mb <= MAX_STORAGE_MB:
+                    break
+                try:
+                    os.remove(fpath)
+                    total_mb -= size / (1024 * 1024)
+                    print(f"🧹 clean_storage: eliminado por cuota → {os.path.basename(fpath)}")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[clean_storage] Error: {e}")
+
+
+# ─────────────────────────────────────────────
 # APP FLASK
 # ─────────────────────────────────────────────
 app = Flask(__name__)
@@ -479,6 +533,27 @@ CORS(app)
 # Con JSON_SORT_KEYS=True (defecto en versiones antiguas de Flask) las claves
 # se ordenan alfabéticamente, destruyendo el orden original de los mensajes.
 app.config["JSON_SORT_KEYS"] = False
+
+
+@app.before_request
+def _before_each_request():
+    """Limpia almacenamiento temporal en cada petición entrante."""
+    clean_storage()
+
+
+@app.route("/", methods=["GET"])
+def root():
+    """
+    Ruta raíz requerida para que Fly.io confirme que el servidor
+    está activo al despertar del estado suspendido.
+    Evita errores 'Not Found' en la primera petición tras auto_stop.
+    """
+    return jsonify({
+        "status":  "ok",
+        "service": "vehiculos-pe API",
+        "bot":     AZURA_BOT,
+        "uso":     "GET /placav?placa=ABC123",
+    }), 200
 
 
 @app.route("/files/<path:filename>")
