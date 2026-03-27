@@ -3,10 +3,12 @@ import re
 import asyncio
 import threading
 import time
-from flask import Flask, request, jsonify, send_from_directory
+import traceback
+from flask import Flask, request, jsonify, send_from_directory, g
 from flask_cors import CORS
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from werkzeug.exceptions import HTTPException
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN DE ENTORNO
@@ -38,6 +40,10 @@ ABSOLUTE_TIMEOUT       = 50
 # ─────────────────────────────────────────────
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def log(message: str):
+    print(message, flush=True)
 
 
 # ═════════════════════════════════════════════
@@ -323,11 +329,14 @@ async def send_azura_command(command: str) -> dict:
                 "event_message": event.message,
             })
             last_msg_time[0] = time.time()
-            print(f"[Azura] Msg #{len(messages_received)}: "
-                  f"{'«' + raw[:60] + '»' if raw else '(solo media)'}")
+            print(
+                f"[Azura] Msg #{len(messages_received)}: "
+                f"{'«' + raw[:60] + '»' if raw else '(solo media)'}",
+                flush=True
+            )
 
         # ── ENVÍO ÚNICO ──────────────────────────────────────
-        print(f"[Azura] → Enviando: {command}")
+        log(f"[Azura] → Enviando: {command}")
         await client.send_message(AZURA_BOT, command)
         start = time.time()
 
@@ -337,25 +346,27 @@ async def send_azura_command(command: str) -> dict:
 
             # Techo absoluto
             if elapsed >= ABSOLUTE_TIMEOUT:
-                print("[Azura] Techo absoluto alcanzado.")
+                log("[Azura] Techo absoluto alcanzado.")
                 break
 
             if last_msg_time[0] is None:
                 # Sin primer mensaje aún
                 if elapsed >= FIRST_RESPONSE_TIMEOUT:
-                    print("[Azura] Timeout: sin respuesta del bot.")
+                    log("[Azura] Timeout: sin respuesta del bot.")
                     break
             else:
                 # Verificar si es SOLO un mensaje de ANTISPAM
                 if _only_antispam(messages_received):
-                    print("[Azura] Sólo mensaje ANTISPAM recibido.")
+                    log("[Azura] Sólo mensaje ANTISPAM recibido.")
                     break
 
                 # Silencio tras el último mensaje
                 silence = time.time() - last_msg_time[0]
                 if silence >= SILENCE_TIMEOUT:
-                    print(f"[Azura] Silencio {silence:.1f}s → respuesta completa "
-                          f"({len(messages_received)} msg(s)).")
+                    log(
+                        f"[Azura] Silencio {silence:.1f}s → respuesta completa "
+                        f"({len(messages_received)} msg(s))."
+                    )
                     break
 
             await asyncio.sleep(0.3)
@@ -378,8 +389,8 @@ async def send_azura_command(command: str) -> dict:
                 "ANTISPAM activo. Espera unos segundos y reintenta."
             )
             return {
-                "status":             "antispam",
-                "message":            msg,
+                "status":              "antispam",
+                "message":             msg,
                 "retry_after_seconds": wait_s,
             }
 
@@ -399,9 +410,9 @@ async def send_azura_command(command: str) -> dict:
                             "url":  f"{PUBLIC_URL}/files/{fname}",
                             "type": "document",
                         })
-                        print(f"[Azura] Archivo: {fname}")
+                        log(f"[Azura] Archivo: {fname}")
                 except Exception as dl_err:
-                    print(f"[Azura] Error descarga: {dl_err}")
+                    log(f"[Azura] Error descarga: {dl_err}")
 
         return build_response(messages_received, file_urls)
 
@@ -503,7 +514,7 @@ def clean_storage():
                 except Exception:
                     pass
         if removed:
-            print(f"🧹 clean_storage: {removed} archivo(s) eliminados por antigüedad")
+            log(f"🧹 clean_storage: {removed} archivo(s) eliminados por antigüedad")
 
         # Pasada 2 — eliminar por cuota si sigue alto
         remaining = [(p, m, s) for p, m, s in files_info if os.path.isfile(p)]
@@ -516,11 +527,11 @@ def clean_storage():
                 try:
                     os.remove(fpath)
                     total_mb -= size / (1024 * 1024)
-                    print(f"🧹 clean_storage: eliminado por cuota → {os.path.basename(fpath)}")
+                    log(f"🧹 clean_storage: eliminado por cuota → {os.path.basename(fpath)}")
                 except Exception:
                     pass
     except Exception as e:
-        print(f"[clean_storage] Error: {e}")
+        log(f"[clean_storage] Error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -538,7 +549,37 @@ app.config["JSON_SORT_KEYS"] = False
 @app.before_request
 def _before_each_request():
     """Limpia almacenamiento temporal en cada petición entrante."""
+    g.request_started_at = time.time()
+    g.request_id = f"{int(g.request_started_at * 1000)}-{os.getpid()}-{threading.get_ident()}"
+    log(
+        f"[HTTP] → {request.method} {request.path}"
+        f" query={dict(request.args)} "
+        f"ip={request.headers.get('fly-client-ip') or request.headers.get('x-forwarded-for') or request.remote_addr}"
+        f" request_id={g.request_id}"
+    )
     clean_storage()
+
+
+@app.after_request
+def _after_each_request(response):
+    started = getattr(g, "request_started_at", None)
+    duration_ms = ((time.time() - started) * 1000) if started else 0
+    log(
+        f"[HTTP] ← {request.method} {request.path} status={response.status_code}"
+        f" duration_ms={duration_ms:.1f} request_id={getattr(g, 'request_id', 'n/a')}"
+    )
+    return response
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc):
+    if isinstance(exc, HTTPException):
+        return exc
+    log(
+        f"[ERROR] {request.method if request else 'N/A'} {request.path if request else 'N/A'} "
+        f"request_id={getattr(g, 'request_id', 'n/a')} exc={exc}\n{traceback.format_exc()}"
+    )
+    return jsonify({"status": "error", "message": "Error interno del servidor."}), 500
 
 
 @app.route("/", methods=["GET"])
@@ -563,7 +604,7 @@ def serve_file(filename):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "healthy", "bot": AZURA_BOT})
+    return jsonify({"status": "healthy", "bot": AZURA_BOT, "port": PORT})
 
 
 @app.route("/status")
@@ -571,6 +612,7 @@ def status():
     return jsonify({
         "status": "online",
         "bot":    AZURA_BOT,
+        "port":   PORT,
         "timeouts": {
             "first_response_sec": FIRST_RESPONSE_TIMEOUT,
             "silence_sec":        SILENCE_TIMEOUT,
@@ -693,4 +735,5 @@ if __name__ == "__main__":
     # threaded=True es requerido para que la deduplicación funcione
     # correctamente: cada request corre en su propio hilo y puede
     # esperar el resultado del hilo "owner" sin bloquear el servidor.
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    log(f"[BOOT] Iniciando vehiculos-pe en 0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False, use_reloader=False)
